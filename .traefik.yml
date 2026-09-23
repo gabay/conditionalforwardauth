@@ -1,0 +1,49 @@
+displayName: ConditionalForwardAuth
+type: middleware
+iconPath: .assets/icon.png
+
+import: github.com/gabay/conditionalforwardauth
+
+summary: 'Traefik ForwardAuth with rule-based, template-driven exemptions (skipAuthWhen).'
+
+# skipAuthWhen exempts requests from authentication.
+#
+# Each rule renders `expression` as a Go template against the request, then
+# tests the result with its predicates. A rule matches when ANY value of ANY
+# predicate matches; auth is skipped when ANY rule matches.
+#
+# Available substitutions. Note the SINGLE braces: Traefik itself uses {{ }} in
+# templated config and provider labels, so expressions avoid them. Always quote
+# an expression in YAML, or "{ .Host }" is read as a flow mapping.
+#   { .Host }       request host, may include a port (e.g. "api.example.com")
+#   { .Path }       URL path only, cleaned; never query or fragment (e.g. "/v1/users")
+#   { .Method }     HTTP method (e.g. "GET")
+#   { .Scheme }     "https" or "http", from the accepted connection (X-Forwarded-Proto is never used)
+#   { .UserAgent }  User-Agent header
+#   { .ClientIp }   peer IP from RemoteAddr, no port (X-Forwarded-For is never used)
+#
+# Predicates: isExactly (lookup map), startsWith, endsWith, contains, matchesRegex (RE2).
+#
+# debug: log the compiled rules at startup and one line per request resolution
+# to stdout (Traefik gives plugins no logger). Not for production: a line per
+# request, containing host, path and client IP.
+testData:
+  address: "http://example.com/auth"
+  debug: false
+  skipAuthWhen:
+    - expression: "{ .Host }"
+      isExactly:
+        - "public.example.com"
+        - "status.example.com"
+      endsWith:
+        - ".internal"
+    - expression: "{ .Method } { .Host }{ .Path }"
+      isExactly:
+        - "GET example.com/health"
+    - expression: "{ .Host }{ .Path }"
+      startsWith:
+        - "cdn.example.com/assets/"
+      contains:
+        - "/public/"
+      matchesRegex:
+        - "^api\\.example\\.com/v[0-9]+/ping$"
