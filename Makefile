@@ -2,20 +2,15 @@
 
 export GO111MODULE=on
 
-default: vendor lint test
+default: lint test
 
 lint:
-	golangci-lint run
-
-test: test_decode test_go test_yaegi
-	go test -v -cover ./...
+	go vet
 
 # Decodes .traefik.yml with the mapstructure settings Traefik uses. A separate
 # module, so the plugin itself stays standard-library only for Yaegi.
-test_decode:
+test: test_decode test_go test_yaegi
 	cd decodetest && go test ./...
-
-test_go:
 	go test -v -cover ./...
 
 test_yaegi:
