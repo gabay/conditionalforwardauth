@@ -66,6 +66,17 @@ func (d *debugLog) logStartup(skipper *AuthSkipper) {
 	}
 }
 
+// logDecision records the outcome of a request: skipped by m, or sent to the
+// auth server.
+func (d *debugLog) logDecision(args RequestArgs, m ruleMatch, skipped bool) {
+	if skipped {
+		d.logSkip(args, m)
+		return
+	}
+
+	d.logAuth(args)
+}
+
 // logSkip records a request that was exempted from authentication.
 func (d *debugLog) logSkip(args RequestArgs, m ruleMatch) {
 	if d == nil {

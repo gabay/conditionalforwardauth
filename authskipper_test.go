@@ -25,6 +25,16 @@ func benchArgs() RequestArgs {
 // rule is shorthand for the pointer every predefined key takes.
 func rule(r SkipRule) *SkipRule { return &r }
 
+// findRule returns the compiled rule with the given name, or nil.
+func findRule(s *AuthSkipper, name string) *compiledSkipRule {
+	for _, r := range s.rules {
+		if r.name == name {
+			return r
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // NewAuthSkipper
 // ---------------------------------------------------------------------------
@@ -41,32 +51,36 @@ func TestNewAuthSkipper_Valid(t *testing.T) {
 		t.Fatalf("NewAuthSkipper: %v", err)
 	}
 
-	// isExactly must become a lookup map, not a slice scan.
-	if got := len(skipper.host.isExactly); got != 2 {
-		t.Errorf("isExactly map has %d entries, want 2", got)
+	// Names are what errors and debug lines use; they must spell the YAML
+	// keys, and rules must be stored in evaluation order.
+	want := []struct {
+		name string
+		kind ruleKind
+	}{
+		{"host", kindHost}, {"path", kindPath}, {"url", kindURL}, {"clientIp", kindClientIP}, {"custom[0]", kindCustom},
 	}
-	if _, ok := skipper.host.isExactly["a.example.com"]; !ok {
-		t.Error("isExactly map missing a.example.com")
+	if len(skipper.rules) != len(want) {
+		t.Fatalf("compiled %d rules, want %d", len(skipper.rules), len(want))
 	}
-	if len(skipper.path.regexes) != 1 {
-		t.Errorf("compiled %d regexes, want 1", len(skipper.path.regexes))
-	}
-	if len(skipper.clientIP.subnets) != 3 {
-		t.Errorf("compiled %d subnets, want 3", len(skipper.clientIP.subnets))
-	}
-	if skipper.userAgent != nil {
-		t.Error("userAgent rule compiled although not configured")
-	}
-	if len(skipper.custom) != 1 || skipper.custom[0].tmpl == nil {
-		t.Errorf("custom rules = %+v, want one with a parsed template", skipper.custom)
+	for i, r := range skipper.rules {
+		if r.name != want[i].name || r.kind != want[i].kind {
+			t.Errorf("rules[%d] = %q/%v, want %q/%v", i, r.name, r.kind, want[i].name, want[i].kind)
+		}
 	}
 
-	// Names are what errors and debug lines use; they must spell the YAML keys.
-	wantNames := []string{"host", "path", "url", "clientIp", "custom[0]"}
-	for i, r := range skipper.rules() {
-		if r.name != wantNames[i] {
-			t.Errorf("rules()[%d].name = %q, want %q", i, r.name, wantNames[i])
-		}
+	// isExactly must become a lookup map, not a slice scan.
+	host := findRule(skipper, "host")
+	if _, ok := host.isExactly["a.example.com"]; !ok || len(host.isExactly) != 2 {
+		t.Errorf("host.isExactly = %v, want a 2-entry map containing a.example.com", host.isExactly)
+	}
+	if got := len(findRule(skipper, "path").regexes); got != 1 {
+		t.Errorf("compiled %d regexes, want 1", got)
+	}
+	if got := len(findRule(skipper, "clientIp").subnets); got != 3 {
+		t.Errorf("compiled %d subnets, want 3", got)
+	}
+	if findRule(skipper, "custom[0]").tmpl == nil {
+		t.Error("custom[0] has no parsed template")
 	}
 }
 
@@ -188,8 +202,8 @@ func TestNewAuthSkipper_Empty(t *testing.T) {
 	if !skipper.empty() {
 		t.Errorf("empty() = false, want true (need = %06b)", skipper.need)
 	}
-	if len(skipper.rules()) != 0 {
-		t.Errorf("rules() = %d entries, want 0", len(skipper.rules()))
+	if len(skipper.rules) != 0 {
+		t.Errorf("rules = %d entries, want 0", len(skipper.rules))
 	}
 	if skipper.ShouldSkip(benchArgs()) {
 		t.Error("ShouldSkip() = true with no rules, want false")
@@ -350,7 +364,7 @@ func TestAuthSkipper_ShouldSkip_InSubnet(t *testing.T) {
 			args := benchArgs()
 			args.ClientIp = tt.clientIP
 
-			m, got := skipper.match(args)
+			m, got := matchRules(skipper, args)
 			if got != tt.want {
 				t.Fatalf("match() = %v, want %v", got, tt.want)
 			}
@@ -382,7 +396,7 @@ func TestAuthSkipper_ClientIP_StringPredicatesAndSubnet(t *testing.T) {
 		args := benchArgs()
 		args.ClientIp = tt.ip
 
-		m, ok := skipper.match(args)
+		m, ok := matchRules(skipper, args)
 		if ok != (tt.predicate != "") {
 			t.Errorf("%s: match = %v, want %v", tt.ip, ok, tt.predicate != "")
 			continue
@@ -443,7 +457,7 @@ func TestAuthSkipper_ShouldSkip_AnyCustomRuleMatches(t *testing.T) {
 		t.Fatalf("NewAuthSkipper: %v", err)
 	}
 
-	m, ok := skipper.match(benchArgs())
+	m, ok := matchRules(skipper, benchArgs())
 	if !ok {
 		t.Fatal("match() = false, want true (third rule matches)")
 	}
@@ -480,7 +494,7 @@ func TestAuthSkipper_EvaluationOrder(t *testing.T) {
 			t.Fatalf("NewAuthSkipper: %v", err)
 		}
 
-		m, ok := skipper.match(benchArgs())
+		m, ok := matchRules(skipper, benchArgs())
 		if !ok {
 			t.Fatalf("step %d: match() = false, want %s", i, name)
 		}
@@ -504,7 +518,7 @@ func TestAuthSkipper_MatchDetails(t *testing.T) {
 		t.Fatalf("NewAuthSkipper: %v", err)
 	}
 
-	m, ok := skipper.match(benchArgs())
+	m, ok := matchRules(skipper, benchArgs())
 	if !ok {
 		t.Fatal("match() = false, want true")
 	}
@@ -520,7 +534,7 @@ func TestAuthSkipper_MatchDetails(t *testing.T) {
 //
 // NewAuthSkipper rejects such an expression at startup, so the rule is built by
 // hand here to exercise the request-time guard.
-func TestCompiledSkipRule_MatchTemplateFailsClosedOnRenderError(t *testing.T) {
+func TestMatchRule_CustomFailsClosedOnRenderError(t *testing.T) {
 	// Same delimiters as NewAuthSkipper, or { .Nope } would be inert literal
 	// text that renders without error.
 	tmpl, err := template.New("bad").Delims(leftDelim, rightDelim).Parse("{ .Nope }")
@@ -530,6 +544,7 @@ func TestCompiledSkipRule_MatchTemplateFailsClosedOnRenderError(t *testing.T) {
 
 	r := &compiledSkipRule{
 		name: "custom[0]",
+		kind: kindCustom,
 		source: SkipRule{
 			Expression: "{ .Nope }",
 			Contains:   []string{""}, // would match anything that rendered
@@ -538,8 +553,8 @@ func TestCompiledSkipRule_MatchTemplateFailsClosedOnRenderError(t *testing.T) {
 		isExactly: map[string]struct{}{"": {}},
 	}
 
-	if _, ok := r.matchTemplate(benchArgs()); ok {
-		t.Error("matchTemplate() = true on render error, want false (fail closed)")
+	if _, ok := matchRule(r, benchArgs()); ok {
+		t.Error("matchRule() = true on render error, want false (fail closed)")
 	}
 }
 

@@ -64,14 +64,18 @@ func (cfa *ConditionalForwardAuth) ServeHTTP(rw http.ResponseWriter, req *http.R
 	// nothing to log, which is the common production configuration.
 	if cfa.need != needNone {
 		args := newRequestArgs(req, cfa.need)
+		match, ok := matchRules(&cfa.skipper, args)
 
-		if match, ok := cfa.skipper.match(args); ok {
-			cfa.debug.logSkip(args, match)
+		// A nil *debugLog absorbs every call, but under Yaegi the call itself
+		// is what costs (see the note above matchRules), so it is guarded.
+		if cfa.debug != nil {
+			cfa.debug.logDecision(args, match, ok)
+		}
+
+		if ok {
 			cfa.next.ServeHTTP(rw, req)
 			return
 		}
-
-		cfa.debug.logAuth(args)
 	}
 
 	// The ForwardAuth handler was constructed with `next`, so it calls it

@@ -311,7 +311,7 @@ func BenchmarkSkipAuth_EndToEnd_Debug(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		args := newRequestArgs(req, needAll)
-		if m, ok := skipper.match(args); ok {
+		if m, ok := matchRules(skipper, args); ok {
 			debug.logSkip(args, m)
 		} else {
 			debug.logAuth(args)

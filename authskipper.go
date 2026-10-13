@@ -45,7 +45,7 @@ const (
 )
 
 // Rule names, spelled exactly as the skipAuthWhen keys. They label errors and
-// debug lines; custom rules are labelled "custom[i]" (see customRuleName).
+// debug lines; custom rules are named "custom[i]" (see customRuleName).
 const (
 	ruleHost      = "host"
 	rulePath      = "path"
@@ -55,13 +55,17 @@ const (
 	ruleCustom    = "custom"
 )
 
-// ruleKind says which predicates a rule may carry: a predefined key takes the
-// string predicates only, clientIp adds inSubnet, custom adds expression.
+// ruleKind says which request attribute a rule tests, and therefore which
+// predicates it may carry: clientIp alone takes inSubnet, custom alone takes
+// (and requires) expression.
 type ruleKind int
 
 const (
-	kindString ruleKind = iota
+	kindHost ruleKind = iota
+	kindPath
+	kindURL
 	kindClientIP
+	kindUserAgent
 	kindCustom
 )
 
@@ -70,19 +74,16 @@ const (
 // It is created once at startup by NewAuthSkipper, which compiles and probes
 // every rule, and is then read-only and safe for concurrent use.
 //
-// A predefined rule is nil when its key is absent from the configuration, so
-// an unused key costs nothing at request time: not a comparison, and not the
-// extraction of its request attribute either (see need).
+// Only configured keys produce a rule, so an unused key costs nothing at
+// request time: not a comparison, and not the extraction of its request
+// attribute either (see need).
 type AuthSkipper struct {
-	host      *compiledSkipRule
-	path      *compiledSkipRule
-	url       *compiledSkipRule
-	clientIP  *compiledSkipRule
-	userAgent *compiledSkipRule
-	custom    []*compiledSkipRule
+	// rules in evaluation order: the predefined keys in the order of the
+	// SkipRules fields, then custom rules in configuration order.
+	rules []*compiledSkipRule
 
-	// need is the union of the RequestArgs fields the rules above read. It is
-	// what newRequestArgs is told to extract.
+	// need is the union of the RequestArgs fields the rules read. It is what
+	// newRequestArgs is told to extract.
 	need argsNeed
 }
 
@@ -90,9 +91,10 @@ type AuthSkipper struct {
 // parsed, the regexes and subnets compiled and the exact matches loaded into a
 // lookup map, all once at startup rather than per request.
 type compiledSkipRule struct {
-	// name labels the rule in errors and debug lines: "host", "custom[2]"…
+	// name labels the rule in errors and debug lines: "host", "custom[2]", etc.
 	// Precomputed so that a match never has to format it.
 	name string
+	kind ruleKind
 
 	// source is the rule as configured. The string predicates are matched
 	// straight off it; it also backs the startup debug dump, which must print
@@ -143,13 +145,12 @@ func NewAuthSkipper(rules SkipRules) (*AuthSkipper, error) {
 		kind   ruleKind
 		need   argsNeed
 		source *SkipRule
-		target **compiledSkipRule
 	}{
-		{ruleHost, kindString, needHost, rules.Host, &skipper.host},
-		{rulePath, kindString, needPath, rules.Path, &skipper.path},
-		{ruleURL, kindString, needHost | needPath, rules.URL, &skipper.url},
-		{ruleClientIP, kindClientIP, needClientIP, rules.ClientIP, &skipper.clientIP},
-		{ruleUserAgent, kindString, needUserAgent, rules.UserAgent, &skipper.userAgent},
+		{ruleHost, kindHost, needHost, rules.Host},
+		{rulePath, kindPath, needPath, rules.Path},
+		{ruleURL, kindURL, needHost | needPath, rules.URL},
+		{ruleClientIP, kindClientIP, needClientIP, rules.ClientIP},
+		{ruleUserAgent, kindUserAgent, needUserAgent, rules.UserAgent},
 	}
 
 	for _, p := range predefined {
@@ -162,7 +163,7 @@ func NewAuthSkipper(rules SkipRules) (*AuthSkipper, error) {
 			return nil, err
 		}
 
-		*p.target = compiled
+		skipper.rules = append(skipper.rules, compiled)
 		skipper.need |= p.need
 	}
 
@@ -172,7 +173,7 @@ func NewAuthSkipper(rules SkipRules) (*AuthSkipper, error) {
 			return nil, err
 		}
 
-		skipper.custom = append(skipper.custom, compiled)
+		skipper.rules = append(skipper.rules, compiled)
 		// A template may reference any field, so all of them are extracted.
 		skipper.need = needAll
 	}
@@ -191,7 +192,7 @@ func compileSkipRule(name string, kind ruleKind, rule SkipRule) (*compiledSkipRu
 		return nil, err
 	}
 
-	c := &compiledSkipRule{name: name, source: rule}
+	c := &compiledSkipRule{name: name, kind: kind, source: rule}
 
 	if kind == kindCustom {
 		tmpl, err := compileExpression(name, rule.Expression)
@@ -316,51 +317,8 @@ func parseSubnet(s string) (netip.Prefix, error) {
 
 // ShouldSkip reports whether any rule exempts the request from authentication.
 func (s *AuthSkipper) ShouldSkip(args RequestArgs) bool {
-	_, ok := s.match(args)
+	_, ok := matchRules(s, args)
 	return ok
-}
-
-// match returns the first rule that exempts the request, if any. Predefined
-// rules are evaluated first, in the order of the SkipRules fields, then custom
-// rules in configuration order.
-func (s *AuthSkipper) match(args RequestArgs) (ruleMatch, bool) {
-	if s.host != nil {
-		if m, ok := s.host.matchString(args.Host); ok {
-			return m, true
-		}
-	}
-
-	if s.path != nil {
-		if m, ok := s.path.matchString(args.Path); ok {
-			return m, true
-		}
-	}
-
-	if s.url != nil {
-		if m, ok := s.url.matchString(args.Host + args.Path); ok {
-			return m, true
-		}
-	}
-
-	if s.clientIP != nil {
-		if m, ok := s.clientIP.matchClientIP(args.ClientIp); ok {
-			return m, true
-		}
-	}
-
-	if s.userAgent != nil {
-		if m, ok := s.userAgent.matchString(args.UserAgent); ok {
-			return m, true
-		}
-	}
-
-	for _, rule := range s.custom {
-		if m, ok := rule.matchTemplate(args); ok {
-			return m, true
-		}
-	}
-
-	return ruleMatch{}, false
 }
 
 // empty reports whether no rule is configured, which lets the caller avoid
@@ -369,26 +327,12 @@ func (s *AuthSkipper) empty() bool {
 	return s.need == needNone
 }
 
-// rules lists every compiled rule in evaluation order.
-func (s *AuthSkipper) rules() []*compiledSkipRule {
-	all := make([]*compiledSkipRule, 0, 5+len(s.custom))
-
-	for _, rule := range []*compiledSkipRule{s.host, s.path, s.url, s.clientIP, s.userAgent} {
-		if rule != nil {
-			all = append(all, rule)
-		}
-	}
-
-	return append(all, s.custom...)
-}
-
 // describeRules renders the rules for the startup debug dump, one line each, in
 // evaluation order.
 func (s *AuthSkipper) describeRules() []string {
-	rules := s.rules()
-	lines := make([]string, 0, len(rules))
+	lines := make([]string, 0, len(s.rules))
 
-	for _, rule := range rules {
+	for _, rule := range s.rules {
 		var b strings.Builder
 
 		b.WriteString(rule.name)
@@ -435,55 +379,64 @@ func renderTemplate(tmpl *template.Template, args RequestArgs) (string, error) {
 	return buf.String(), nil
 }
 
-// matchTemplate renders a custom rule's expression and tests the result.
+// The request-time path below is written for the Yaegi interpreter, which is
+// where Traefik runs this plugin and where costs look nothing like compiled
+// Go's. Measured with `make bench_yaegi` (see readme.md, "Performance"):
 //
-// A template that fails to render at request time is treated as NOT matching,
-// i.e. the request is authenticated. Failing closed is the only safe choice for
-// a predicate that decides whether to bypass authentication.
-func (c *compiledSkipRule) matchTemplate(args RequestArgs) (ruleMatch, bool) {
-	value, err := renderTemplate(c.tmpl, args)
-	if err != nil {
-		return ruleMatch{}, false
-	}
-
-	return c.matchString(value)
-}
-
-// matchClientIP tests the string predicates, then inSubnet.
+//   - A method call costs about four times a plain function call, so the two
+//     calls made per request, matchRules and matchRule, are functions.
+//   - A call's cost grows with the size of the callee, whichever branch runs,
+//     so matchRule keeps the predicates every key shares inline and pushes the
+//     clientIp-only subnet scan into matchSubnets.
+//   - Calling a method on a nil receiver is a full call; ServeHTTP therefore
+//     guards the debug logger with a nil check instead of relying on the nil
+//     receiver being a no-op.
 //
-// An address that does not parse cannot be in any subnet, so it fails closed:
-// the string predicates may still match it, inSubnet never does.
-func (c *compiledSkipRule) matchClientIP(ip string) (ruleMatch, bool) {
-	if m, ok := c.matchString(ip); ok {
-		return m, true
-	}
+// None of this changes the result of a match; a plain port back to methods
+// would be correct, just slower where it runs.
 
-	if len(c.subnets) == 0 {
-		return ruleMatch{}, false
-	}
-
-	addr, err := netip.ParseAddr(ip)
-	if err != nil {
-		return ruleMatch{}, false
-	}
-
-	// Unmap so that an IPv4 client seen through a dual-stack listener as
-	// ::ffff:10.0.0.7 still lands in 10.0.0.0/8; drop the zone because a
-	// prefix never carries one and Contains would otherwise reject the address.
-	addr = addr.Unmap().WithZone("")
-
-	for _, subnet := range c.subnets {
-		if subnet.Contains(addr) {
-			return ruleMatch{rule: c.name, predicate: predicateInSubnet, pattern: subnet.String(), value: ip}, true
+// matchRules returns the first rule that exempts the request, if any. Rules
+// are evaluated in configuration order: the predefined keys first, in the
+// order of the SkipRules fields, then custom rules.
+func matchRules(s *AuthSkipper, args RequestArgs) (ruleMatch, bool) {
+	for _, rule := range s.rules {
+		if m, ok := matchRule(rule, args); ok {
+			return m, true
 		}
 	}
 
 	return ruleMatch{}, false
 }
 
-// matchString reports whether the string predicates match the value, and if
-// so which one did it.
-func (c *compiledSkipRule) matchString(value string) (ruleMatch, bool) {
+// matchRule picks the attribute the rule tests and runs its predicates over it.
+//
+// A custom template that fails to render at request time is treated as NOT
+// matching, i.e. the request is authenticated. Failing closed is the only safe
+// choice for a predicate that decides whether to bypass authentication.
+//
+//nolint:gocyclo // deliberately one flat function; see the note above matchRules.
+func matchRule(c *compiledSkipRule, args RequestArgs) (ruleMatch, bool) {
+	var value string
+
+	switch c.kind {
+	case kindHost:
+		value = args.Host
+	case kindPath:
+		value = args.Path
+	case kindURL:
+		value = args.Host + args.Path
+	case kindClientIP:
+		value = args.ClientIp
+	case kindUserAgent:
+		value = args.UserAgent
+	case kindCustom:
+		rendered, err := renderTemplate(c.tmpl, args)
+		if err != nil {
+			return ruleMatch{}, false
+		}
+		value = rendered
+	}
+
 	if c.isExactly != nil {
 		if _, ok := c.isExactly[value]; ok {
 			return ruleMatch{rule: c.name, predicate: predicateIsExactly, pattern: value, value: value}, true
@@ -511,6 +464,36 @@ func (c *compiledSkipRule) matchString(value string) (ruleMatch, bool) {
 	for _, re := range c.regexes {
 		if re.MatchString(value) {
 			return ruleMatch{rule: c.name, predicate: predicateMatchesRegex, pattern: re.String(), value: value}, true
+		}
+	}
+
+	// subnets is only ever populated for clientIp, so this is also the kind
+	// check.
+	if len(c.subnets) > 0 {
+		return matchSubnets(c, value)
+	}
+
+	return ruleMatch{}, false
+}
+
+// matchSubnets tests inSubnet.
+//
+// An address that does not parse cannot be in any subnet, so it fails closed:
+// the string predicates may still have matched it, inSubnet never does.
+func matchSubnets(c *compiledSkipRule, ip string) (ruleMatch, bool) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ruleMatch{}, false
+	}
+
+	// Unmap so that an IPv4 client seen through a dual-stack listener as
+	// ::ffff:10.0.0.7 still lands in 10.0.0.0/8; drop the zone because a
+	// prefix never carries one and Contains would otherwise reject the address.
+	addr = addr.Unmap().WithZone("")
+
+	for _, subnet := range c.subnets {
+		if subnet.Contains(addr) {
+			return ruleMatch{rule: c.name, predicate: predicateInSubnet, pattern: subnet.String(), value: ip}, true
 		}
 	}
 
