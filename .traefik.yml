@@ -4,25 +4,34 @@ iconPath: .assets/icon.png
 
 import: github.com/gabay/conditionalforwardauth
 
-summary: 'Traefik ForwardAuth with rule-based, template-driven exemptions (skipAuthWhen).'
+summary: 'Traefik ForwardAuth with rule-based exemptions (skipAuthWhen): host, path, url, clientIp, userAgent or custom templates.'
 
 # skipAuthWhen exempts requests from authentication.
 #
-# Each rule renders `expression` as a Go template against the request, then
-# tests the result with its predicates. A rule matches when ANY value of ANY
-# predicate matches; auth is skipped when ANY rule matches.
+# It is a fixed set of keys, each naming a request attribute and carrying the
+# predicates to test it with. A key matches when ANY value of ANY of its
+# predicates matches; auth is skipped when ANY key matches. Keys are evaluated
+# in the order below and an absent key costs nothing.
+#   host       Host header, may include a port (e.g. "api.example.com")
+#   path       URL path only, cleaned; never query or fragment (e.g. "/v1/users")
+#   url        host and path joined (e.g. "api.example.com/v1/users")
+#   clientIp   peer IP from RemoteAddr, no port (X-Forwarded-For is never used)
+#   userAgent  User-Agent header
+#   custom     a list of template rules for anything else (see below)
 #
-# Available substitutions. Note the SINGLE braces: Traefik itself uses {{ }} in
-# templated config and provider labels, so expressions avoid them. Always quote
-# an expression in YAML, or "{ .Host }" is read as a flow mapping.
-#   { .Host }       request host, may include a port (e.g. "api.example.com")
-#   { .Path }       URL path only, cleaned; never query or fragment (e.g. "/v1/users")
-#   { .Method }     HTTP method (e.g. "GET")
-#   { .Scheme }     "https" or "http", from the accepted connection (X-Forwarded-Proto is never used)
-#   { .UserAgent }  User-Agent header
-#   { .ClientIp }   peer IP from RemoteAddr, no port (X-Forwarded-For is never used)
+# Predicates: isExactly (lookup map), startsWith, endsWith, contains,
+# matchesRegex (RE2). clientIp additionally accepts inSubnet, a list of CIDRs
+# ("10.0.0.0/8", "2001:db8::/32") or bare addresses ("127.0.0.1").
 #
-# Predicates: isExactly (lookup map), startsWith, endsWith, contains, matchesRegex (RE2).
+# custom rules render `expression` as a Go template against the request and
+# test the result with the string predicates. They cover what the keys above
+# cannot (method, scheme, combinations) but are slower: the template runs on
+# every request and every substitution has to be extracted for it.
+#
+# Substitutions. Note the SINGLE braces: Traefik itself uses {{ }} in templated
+# config and provider labels, so expressions avoid them. Always quote an
+# expression in YAML, or "{ .Host }" is read as a flow mapping.
+#   { .Host } { .Path } { .Method } { .Scheme } { .UserAgent } { .ClientIp }
 #
 # debug: log the compiled rules at startup and one line per request resolution
 # to stdout (Traefik gives plugins no logger). Not for production: a line per
@@ -31,19 +40,32 @@ testData:
   address: "http://example.com/auth"
   debug: false
   skipAuthWhen:
-    - expression: "{ .Host }"
+    host:
       isExactly:
         - "public.example.com"
         - "status.example.com"
       endsWith:
         - ".internal"
-    - expression: "{ .Method } { .Host }{ .Path }"
+    path:
       isExactly:
-        - "GET example.com/health"
-    - expression: "{ .Host }{ .Path }"
+        - "/healthz"
+      startsWith:
+        - "/.well-known/"
+    url:
       startsWith:
         - "cdn.example.com/assets/"
       contains:
         - "/public/"
       matchesRegex:
         - "^api\\.example\\.com/v[0-9]+/ping$"
+    clientIp:
+      inSubnet:
+        - "10.0.0.0/8"
+        - "127.0.0.1"
+    userAgent:
+      startsWith:
+        - "kube-probe/"
+    custom:
+      - expression: "{ .Method } { .Host }{ .Path }"
+        isExactly:
+          - "GET example.com/health"
