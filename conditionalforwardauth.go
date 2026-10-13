@@ -18,6 +18,11 @@ type ConditionalForwardAuth struct {
 	forwardAuth http.Handler
 	next        http.Handler
 	debug       *debugLog // nil unless config.Debug is set; see debuglog.go.
+
+	// need is which RequestArgs fields to extract per request: whatever the
+	// rules read, plus everything when debug is on because a debug line prints
+	// the request. needNone means the request is not inspected at all.
+	need argsNeed
 }
 
 // New creates a new ConditionalForwardAuth plugin.
@@ -32,6 +37,11 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	debug := newDebugLog(config.Debug, name)
 	debug.logStartup(skipper)
 
+	need := skipper.need
+	if debug != nil {
+		need = needAll
+	}
+
 	fa, err := NewForwardAuth(ctx, next, config)
 	if err != nil {
 		return nil, err
@@ -45,16 +55,17 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		forwardAuth: fa,
 		next:        next,
 		debug:       debug,
+		need:        need,
 	}, nil
 }
 
 func (cfa *ConditionalForwardAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// Building RequestArgs is skipped entirely when there is nothing to match
-	// and nothing to log, which is the common production configuration.
-	if !cfa.skipper.empty() || cfa.debug != nil {
-		args := newRequestArgs(req)
+	// The request is not inspected at all when there is nothing to match and
+	// nothing to log, which is the common production configuration.
+	if cfa.need != needNone {
+		args := newRequestArgs(req, cfa.need)
 
-		if match, ok := cfa.skipper.matches(args); ok {
+		if match, ok := cfa.skipper.match(args); ok {
 			cfa.debug.logSkip(args, match)
 			cfa.next.ServeHTTP(rw, req)
 			return
@@ -68,21 +79,38 @@ func (cfa *ConditionalForwardAuth) ServeHTTP(rw http.ResponseWriter, req *http.R
 	cfa.forwardAuth.ServeHTTP(rw, req)
 }
 
-// newRequestArgs extracts the expression substitutions from a request.
+// newRequestArgs extracts the requested fields from a request; the others are
+// left empty. Extracting only what the configured rules read is part of what
+// makes a predefined rule cheaper than a custom template, which needs every
+// field.
 //
 // No value here is derived from a client-supplied X-Forwarded-* header. These
 // substitutions gate an authentication bypass, so they are taken only from the
 // request line, the Host header and the connection itself. That keeps the
 // exemption rules independent of trustForwardHeader.
-func newRequestArgs(req *http.Request) RequestArgs {
-	return RequestArgs{
-		Host:      req.Host,
-		Path:      cleanPath(req.URL.Path),
-		Method:    req.Method,
-		Scheme:    requestScheme(req),
-		UserAgent: req.UserAgent(),
-		ClientIp:  clientIP(req),
+func newRequestArgs(req *http.Request, need argsNeed) RequestArgs {
+	var args RequestArgs
+
+	if need&needHost != 0 {
+		args.Host = req.Host
 	}
+	if need&needPath != 0 {
+		args.Path = cleanPath(req.URL.Path)
+	}
+	if need&needMethod != 0 {
+		args.Method = req.Method
+	}
+	if need&needScheme != 0 {
+		args.Scheme = requestScheme(req)
+	}
+	if need&needUserAgent != 0 {
+		args.UserAgent = req.UserAgent()
+	}
+	if need&needClientIP != 0 {
+		args.ClientIp = clientIP(req)
+	}
+
+	return args
 }
 
 // cleanPath normalizes the request path before matching.
@@ -105,7 +133,7 @@ func cleanPath(p string) string {
 // X-Forwarded-Proto is deliberately NOT consulted: it is client-supplied, and
 // honouring it would let a client flip { .Scheme } to satisfy an exemption
 // rule. If Traefik itself sits behind another proxy, prefer expressing such
-// rules with { .Host } / { .Path }.
+// rules with host / path.
 func requestScheme(req *http.Request) string {
 	if req.TLS != nil {
 		return "https"
@@ -123,13 +151,13 @@ func requestScheme(req *http.Request) string {
 // trustForwardHeader, because it is client-supplied and this value can exempt a
 // request from authentication. A rule such as
 //
-//	expression: "{ .ClientIp }"
-//	isExactly: ["10.0.0.5"]
+//	clientIp:
+//	  inSubnet: ["10.0.0.0/8"]
 //
 // therefore matches only a direct peer. Note that when Traefik sits behind
 // another proxy or load balancer, RemoteAddr is that intermediary's address,
 // not the end user's, so such a rule would exempt everything arriving through
-// it. Prefer { .Host } / { .Path } rules in that topology.
+// it. Prefer host / path rules in that topology.
 func clientIP(req *http.Request) string {
 	// SplitHostPort keeps IPv6 literals such as "[2001:db8::1]:54321" intact.
 	host, _, err := net.SplitHostPort(req.RemoteAddr)

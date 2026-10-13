@@ -25,7 +25,7 @@ func captureDebug(t *testing.T) *bytes.Buffer {
 
 // newDebugPlugin builds a plugin with debug on and returns it alongside the
 // captured output, which is reset so the caller sees only request lines.
-func newDebugPlugin(t *testing.T, rules []SkipRule) (http.Handler, *bytes.Buffer) {
+func newDebugPlugin(t *testing.T, rules SkipRules) (http.Handler, *bytes.Buffer) {
 	t.Helper()
 
 	buf := captureDebug(t)
@@ -57,17 +57,27 @@ func newDebugPlugin(t *testing.T, rules []SkipRule) (http.Handler, *bytes.Buffer
 func TestDebug_LogsRulesAtStartup(t *testing.T) {
 	buf := captureDebug(t)
 
-	skipper, err := NewAuthSkipper([]SkipRule{
-		{
-			Expression: "{ .Host }",
-			IsExactly:  []string{"a.example.com", "b.example.com"},
-			EndsWith:   []string{".internal"},
+	// Declared out of evaluation order on purpose: the dump must follow the
+	// order rules are tested in (host, path, url, clientIp, userAgent, then
+	// custom), not the order they happen to be written in, so that an
+	// operator reading it can tell which rule wins a request.
+	skipper, err := NewAuthSkipper(SkipRules{
+		Custom: []SkipRule{{
+			Expression: "{ .Method } { .Host }{ .Path }",
+			IsExactly:  []string{"GET example.com/health"},
+		}},
+		ClientIP: &SkipRule{
+			IsExactly: []string{"127.0.0.1"},
+			InSubnet:  []string{"10.0.0.0/8", "2001:db8::/32"},
 		},
-		{
-			Expression:   "{ .Path }",
+		Path: &SkipRule{
 			StartsWith:   []string{"/v1/"},
 			Contains:     []string{"/public/"},
 			MatchesRegex: []string{`^/v[0-9]+/ping$`},
+		},
+		Host: &SkipRule{
+			IsExactly: []string{"a.example.com", "b.example.com"},
+			EndsWith:  []string{".internal"},
 		},
 	})
 	if err != nil {
@@ -76,9 +86,12 @@ func TestDebug_LogsRulesAtStartup(t *testing.T) {
 
 	newDebugLog(true, "mw").logStartup(skipper)
 
-	want := `[conditionalforwardauth:mw] debug on, 2 skip rule(s):
-[conditionalforwardauth:mw] rule[0] "{ .Host }" isExactly ["a.example.com" "b.example.com"] endsWith [".internal"]
-[conditionalforwardauth:mw] rule[1] "{ .Path }" startsWith ["/v1/"] contains ["/public/"] matchesRegex ["^/v[0-9]+/ping$"]
+	// Only custom rules carry an expression, so only they print one.
+	want := `[conditionalforwardauth:mw] debug on, 4 skip rule(s):
+[conditionalforwardauth:mw] host isExactly ["a.example.com" "b.example.com"] endsWith [".internal"]
+[conditionalforwardauth:mw] path startsWith ["/v1/"] contains ["/public/"] matchesRegex ["^/v[0-9]+/ping$"]
+[conditionalforwardauth:mw] clientIp isExactly ["127.0.0.1"] inSubnet ["10.0.0.0/8" "2001:db8::/32"]
+[conditionalforwardauth:mw] custom[0] "{ .Method } { .Host }{ .Path }" isExactly ["GET example.com/health"]
 `
 
 	if got := buf.String(); got != want {
@@ -89,7 +102,7 @@ func TestDebug_LogsRulesAtStartup(t *testing.T) {
 func TestDebug_LogsStartupWithoutRules(t *testing.T) {
 	buf := captureDebug(t)
 
-	skipper, err := NewAuthSkipper(nil)
+	skipper, err := NewAuthSkipper(SkipRules{})
 	if err != nil {
 		t.Fatalf("NewAuthSkipper: %v", err)
 	}
@@ -107,42 +120,53 @@ func TestDebug_LogsStartupWithoutRules(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDebug_LogsRequestResolution(t *testing.T) {
-	// One rule per predicate, so the logged predicate name can be checked
-	// against the one that actually fired.
-	rules := []SkipRule{
-		{Expression: "{ .Method } { .Host }{ .Path }", IsExactly: []string{"GET a.example.com/health"}},
-		{Expression: "{ .Host }{ .Path }", StartsWith: []string{"cdn.example.com/assets/"}},
-		{Expression: "{ .Host }", EndsWith: []string{".internal"}},
-		{Expression: "{ .Path }", Contains: []string{"/public/"}},
-		{Expression: "{ .Path }", MatchesRegex: []string{`^/v[0-9]+/ping$`}},
+	// One predicate per rule, so the logged rule and predicate names can be
+	// checked against the ones that actually fired.
+	rules := SkipRules{
+		Host:      &SkipRule{EndsWith: []string{".internal"}},
+		Path:      &SkipRule{Contains: []string{"/public/"}},
+		URL:       &SkipRule{StartsWith: []string{"cdn.example.com/assets/"}},
+		ClientIP:  &SkipRule{InSubnet: []string{"10.0.0.0/8"}},
+		UserAgent: &SkipRule{MatchesRegex: []string{`^kube-probe/`}},
+		Custom: []SkipRule{
+			{Expression: "{ .Method } { .Host }{ .Path }", IsExactly: []string{"GET a.example.com/health"}},
+		},
 	}
 
 	tests := []struct {
-		name   string
-		host   string
-		target string
-		want   string
+		name       string
+		host       string
+		target     string
+		remoteAddr string
+		userAgent  string
+		want       string
 	}{
 		{
 			name: "isExactly", host: "a.example.com", target: "/health",
-			// No "in" clause: for isExactly the rendered value is the pattern.
-			want: `skip GET http://a.example.com/health from 192.0.2.1 -> rule[0] isExactly "GET a.example.com/health"`,
+			// No "in" clause: for isExactly the tested value is the pattern.
+			want: `skip GET http://a.example.com/health from 192.0.2.1 -> custom[0] isExactly "GET a.example.com/health"`,
 		},
 		{
 			name: "startsWith", host: "cdn.example.com", target: "/assets/app.css",
-			want: `skip GET http://cdn.example.com/assets/app.css from 192.0.2.1 -> rule[1] startsWith "cdn.example.com/assets/" in "cdn.example.com/assets/app.css"`,
+			want: `skip GET http://cdn.example.com/assets/app.css from 192.0.2.1 -> url startsWith "cdn.example.com/assets/" in "cdn.example.com/assets/app.css"`,
 		},
 		{
 			name: "endsWith", host: "svc.internal", target: "/x",
-			want: `skip GET http://svc.internal/x from 192.0.2.1 -> rule[2] endsWith ".internal" in "svc.internal"`,
+			want: `skip GET http://svc.internal/x from 192.0.2.1 -> host endsWith ".internal" in "svc.internal"`,
 		},
 		{
 			name: "contains", host: "example.com", target: "/a/public/b",
-			want: `skip GET http://example.com/a/public/b from 192.0.2.1 -> rule[3] contains "/public/" in "/a/public/b"`,
+			want: `skip GET http://example.com/a/public/b from 192.0.2.1 -> path contains "/public/" in "/a/public/b"`,
 		},
 		{
-			name: "matchesRegex", host: "example.com", target: "/v2/ping",
-			want: `skip GET http://example.com/v2/ping from 192.0.2.1 -> rule[4] matchesRegex "^/v[0-9]+/ping$" in "/v2/ping"`,
+			name: "matchesRegex", host: "example.com", target: "/x", userAgent: "kube-probe/1.29",
+			want: `skip GET http://example.com/x from 192.0.2.1 -> userAgent matchesRegex "^kube-probe/" in "kube-probe/1.29"`,
+		},
+		{
+			// The pattern is the network as configured and the value the
+			// peer address, so an operator can see which range caught it.
+			name: "inSubnet", host: "example.com", target: "/x", remoteAddr: "10.1.2.3:4567",
+			want: `skip GET http://example.com/x from 10.1.2.3 -> clientIp inSubnet "10.0.0.0/8" in "10.1.2.3"`,
 		},
 		{
 			name: "no rule matches", host: "example.com", target: "/private",
@@ -156,6 +180,12 @@ func TestDebug_LogsRequestResolution(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodGet, "http://"+tt.host+tt.target, nil)
 			req.Host = tt.host
+			if tt.remoteAddr != "" {
+				req.RemoteAddr = tt.remoteAddr
+			}
+			if tt.userAgent != "" {
+				req.Header.Set("User-Agent", tt.userAgent)
+			}
 
 			h.ServeHTTP(httptest.NewRecorder(), req)
 
@@ -170,7 +200,7 @@ func TestDebug_LogsRequestResolution(t *testing.T) {
 // The query string is not matched on, so it must not appear in the log either:
 // a debug line has to describe what was actually tested.
 func TestDebug_RequestLineOmitsQuery(t *testing.T) {
-	h, buf := newDebugPlugin(t, []SkipRule{{Expression: "{ .Path }", Contains: []string{"/health"}}})
+	h, buf := newDebugPlugin(t, SkipRules{Path: &SkipRule{Contains: []string{"/health"}}})
 
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/private?redirect=/health", nil)
 	req.Host = "example.com"
@@ -184,7 +214,7 @@ func TestDebug_RequestLineOmitsQuery(t *testing.T) {
 
 // Exactly one line per request, whatever the outcome.
 func TestDebug_OneLinePerRequest(t *testing.T) {
-	h, buf := newDebugPlugin(t, []SkipRule{{Expression: "{ .Path }", IsExactly: []string{"/health"}}})
+	h, buf := newDebugPlugin(t, SkipRules{Path: &SkipRule{IsExactly: []string{"/health"}}})
 
 	for _, target := range []string{"/health", "/private", "/health"} {
 		req := httptest.NewRequest(http.MethodGet, "http://example.com"+target, nil)
@@ -211,7 +241,7 @@ func TestDebug_DisabledWritesNothing(t *testing.T) {
 
 	cfg := CreateConfig()
 	cfg.Address = server.URL
-	cfg.SkipAuthWhen = []SkipRule{{Expression: "{ .Path }", IsExactly: []string{"/health"}}}
+	cfg.SkipAuthWhen = SkipRules{Path: &SkipRule{IsExactly: []string{"/health"}}}
 	// cfg.Debug stays false.
 
 	h, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), cfg, "mw")
@@ -248,7 +278,7 @@ func TestDebug_NilLoggerIsSafe(t *testing.T) {
 	d.printf("ignored %d", 1)
 	d.logStartup(&AuthSkipper{})
 	d.logAuth(probeArgs)
-	d.logSkip(probeArgs, ruleMatch{predicate: predicateContains, pattern: "x", rendered: "y"})
+	d.logSkip(probeArgs, ruleMatch{rule: "host", predicate: predicateContains, pattern: "x", value: "y"})
 }
 
 // ---------------------------------------------------------------------------
@@ -257,15 +287,17 @@ func TestDebug_NilLoggerIsSafe(t *testing.T) {
 
 // Cost of the debug path itself, discarding the output. Compare with
 // BenchmarkSkipAuth_EndToEnd for what debug: true actually costs per request.
+// Debug forces full extraction (needAll) regardless of the rules, exactly as
+// New does.
 func BenchmarkSkipAuth_EndToEnd_Debug(b *testing.B) {
 	previous := debugOutput
 	debugOutput = io.Discard
 
 	defer func() { debugOutput = previous }()
 
-	skipper, err := NewAuthSkipper([]SkipRule{
-		{Expression: "{ .Host }", IsExactly: []string{"public.example.com"}},
-		{Expression: "{ .Host }{ .Path }", StartsWith: []string{"api.example.com/v1/"}},
+	skipper, err := NewAuthSkipper(SkipRules{
+		Host: &SkipRule{IsExactly: []string{"public.example.com"}},
+		URL:  &SkipRule{StartsWith: []string{"api.example.com/v1/"}},
 	})
 	if err != nil {
 		b.Fatalf("NewAuthSkipper: %v", err)
@@ -278,8 +310,8 @@ func BenchmarkSkipAuth_EndToEnd_Debug(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		args := newRequestArgs(req)
-		if m, ok := skipper.matches(args); ok {
+		args := newRequestArgs(req, needAll)
+		if m, ok := skipper.match(args); ok {
 			debug.logSkip(args, m)
 		} else {
 			debug.logAuth(args)

@@ -72,14 +72,14 @@ func (d *debugLog) logSkip(args RequestArgs, m ruleMatch) {
 		return
 	}
 
-	// The rendered expression is only worth showing when it differs from the
+	// The tested value is only worth showing when it differs from the
 	// pattern, which it always does except for isExactly.
-	var rendered string
-	if m.rendered != m.pattern {
-		rendered = fmt.Sprintf(" in %q", m.rendered)
+	var value string
+	if m.value != m.pattern {
+		value = fmt.Sprintf(" in %q", m.value)
 	}
 
-	d.printf("skip %s -> rule[%d] %s %q%s", requestLine(args), m.index, m.predicate, m.pattern, rendered)
+	d.printf("skip %s -> %s %s %q%s", requestLine(args), m.rule, m.predicate, m.pattern, value)
 }
 
 // logAuth records a request that is being handed to the auth server.
@@ -94,7 +94,7 @@ func (d *debugLog) logAuth(args RequestArgs) {
 // requestLine is the request identity shared by every request-scoped line.
 //
 // UserAgent is deliberately left out: it is long, rarely the discriminator, and
-// when a rule does match on it the rendered expression already shows it.
+// when a rule does match on it the logged value already shows it.
 func requestLine(args RequestArgs) string {
 	var b strings.Builder
 

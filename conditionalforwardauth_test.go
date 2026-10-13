@@ -10,7 +10,7 @@ import (
 )
 
 // newTestPlugin wires a plugin whose auth server and next handler both count calls.
-func newTestPlugin(t *testing.T, rules []SkipRule, trustForwardHeader *bool) (h http.Handler, authCalls, nextCalls *int) {
+func newTestPlugin(t *testing.T, rules SkipRules, trustForwardHeader *bool) (h http.Handler, authCalls, nextCalls *int) {
 	t.Helper()
 
 	authCalls = new(int)
@@ -38,25 +38,25 @@ func newTestPlugin(t *testing.T, rules []SkipRule, trustForwardHeader *bool) (h 
 }
 
 func TestSkipAuthWhen_Predicates(t *testing.T) {
-	rules := []SkipRule{
-		{
-			Expression: "{ .Host }",
-			IsExactly:  []string{"a.example.com"},
-			EndsWith:   []string{".internal"},
+	// Every predicate is exercised, spread over the predefined keys where one
+	// fits and over a custom template where the expression is genuinely
+	// composite, so that both code paths are covered end-to-end.
+	rules := SkipRules{
+		Host: &SkipRule{
+			IsExactly: []string{"a.example.com"},
+			EndsWith:  []string{".internal"},
 		},
-		{
-			Expression: "{ .Method } { .Host }{ .Path }",
-			IsExactly:  []string{"GET example.com/health"},
+		Path: &SkipRule{
+			MatchesRegex: []string{`^/v[0-9]+/ping$`},
 		},
-		{
-			Expression: "{ .Host }{ .Path }",
+		URL: &SkipRule{
 			StartsWith: []string{"cdn.example.com/assets/"},
 			Contains:   []string{"/public/"},
 		},
-		{
-			Expression:   "{ .Path }",
-			MatchesRegex: []string{`^/v[0-9]+/ping$`},
-		},
+		Custom: []SkipRule{{
+			Expression: "{ .Method } { .Host }{ .Path }",
+			IsExactly:  []string{"GET example.com/health"},
+		}},
 	}
 
 	tests := []struct {
@@ -71,8 +71,8 @@ func TestSkipAuthWhen_Predicates(t *testing.T) {
 		{"endsWith on host", "GET", "svc.internal", "/x", true},
 		{"method+host+path exact", "GET", "example.com", "/health", true},
 		{"same path wrong method", "POST", "example.com", "/health", false},
-		{"startsWith on host+path", "GET", "cdn.example.com", "/assets/app.css", true},
-		{"contains on host+path", "GET", "example.com", "/a/public/b", true},
+		{"startsWith on url", "GET", "cdn.example.com", "/assets/app.css", true},
+		{"contains on url", "GET", "example.com", "/a/public/b", true},
 		{"matchesRegex on path", "GET", "example.com", "/v2/ping", true},
 		{"regex is anchored so no match", "GET", "example.com", "/v2/ping/extra", false},
 		{"nothing matches", "GET", "example.com", "/private", false},
@@ -101,10 +101,7 @@ func TestSkipAuthWhen_Predicates(t *testing.T) {
 // matches on the path only, so a skip value smuggled into ?q= cannot exempt a
 // protected route.
 func TestSkipAuthWhen_IgnoresQueryAndFragment(t *testing.T) {
-	rules := []SkipRule{{
-		Expression: "{ .Host }{ .Path }",
-		Contains:   []string{"/health"},
-	}}
+	rules := SkipRules{URL: &SkipRule{Contains: []string{"/health"}}}
 
 	h, authCalls, _ := newTestPlugin(t, rules, nil)
 
@@ -121,10 +118,7 @@ func TestSkipAuthWhen_IgnoresQueryAndFragment(t *testing.T) {
 // path.Clean is applied before matching, so traversal cannot be used to match a
 // skip rule while the backend serves a different, protected path.
 func TestSkipAuthWhen_PathTraversalCannotBypassAuth(t *testing.T) {
-	rules := []SkipRule{{
-		Expression: "{ .Path }",
-		StartsWith: []string{"/public/"},
-	}}
+	rules := SkipRules{Path: &SkipRule{StartsWith: []string{"/public/"}}}
 
 	h, authCalls, _ := newTestPlugin(t, rules, nil)
 
@@ -138,11 +132,13 @@ func TestSkipAuthWhen_PathTraversalCannotBypassAuth(t *testing.T) {
 	}
 }
 
+// A custom template may reference every RequestArgs field, and a custom rule
+// must therefore have all of them populated at request time.
 func TestSkipAuthWhen_AllSubstitutions(t *testing.T) {
-	rules := []SkipRule{{
+	rules := SkipRules{Custom: []SkipRule{{
 		Expression: "{ .Method }|{ .Scheme }|{ .Host }|{ .Path }|{ .UserAgent }|{ .ClientIp }",
 		IsExactly:  []string{"GET|http|example.com|/x|curl/8|192.0.2.9"},
-	}}
+	}}}
 
 	h, authCalls, _ := newTestPlugin(t, rules, nil)
 
@@ -163,16 +159,16 @@ func TestSkipAuthWhen_AllSubstitutions(t *testing.T) {
 // connection and .ClientIp from RemoteAddr, always.
 func TestSkipAuthWhen_ForwardedHeadersNeverAffectMatching(t *testing.T) {
 	// This rule matches only if the spoofed headers were believed.
-	spoofRules := []SkipRule{{
+	spoofRules := SkipRules{Custom: []SkipRule{{
 		Expression: "{ .Scheme } { .ClientIp }",
 		IsExactly:  []string{"https 203.0.113.7"},
-	}}
+	}}}
 
 	// This rule matches the true connection values.
-	realRules := []SkipRule{{
+	realRules := SkipRules{Custom: []SkipRule{{
 		Expression: "{ .Scheme } { .ClientIp }",
 		IsExactly:  []string{"http 10.0.0.1"},
-	}}
+	}}}
 
 	for _, trust := range []*bool{nil, boolPtr(false), boolPtr(true)} {
 		name := "trust=unset"
@@ -212,10 +208,7 @@ func spoofedRequest() *http.Request {
 }
 
 func TestSkipAuthWhen_IPv6ClientIP(t *testing.T) {
-	rules := []SkipRule{{
-		Expression: "{ .ClientIp }",
-		IsExactly:  []string{"2001:db8::1"},
-	}}
+	rules := SkipRules{ClientIP: &SkipRule{IsExactly: []string{"2001:db8::1"}}}
 
 	h, authCalls, _ := newTestPlugin(t, rules, nil)
 
@@ -230,6 +223,47 @@ func TestSkipAuthWhen_IPv6ClientIP(t *testing.T) {
 	}
 }
 
+// inSubnet is the one predicate that is not a string comparison, so it gets
+// its own end-to-end check: the decision has to hold for the address formats
+// RemoteAddr actually takes, including the bracketed IPv6 form.
+func TestSkipAuthWhen_ClientIPInSubnet(t *testing.T) {
+	rules := SkipRules{ClientIP: &SkipRule{
+		InSubnet: []string{"10.0.0.0/8", "192.0.2.7", "2001:db8::/32"},
+	}}
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		expectSkip bool
+	}{
+		{"ipv4 cidr hit", "10.1.2.3:1234", true},
+		{"ipv4 cidr miss", "11.0.0.1:1234", false},
+		{"bare address hit", "192.0.2.7:1234", true},
+		{"bare address is a single host", "192.0.2.8:1234", false},
+		{"ipv6 cidr hit", "[2001:db8::1]:54321", true},
+		{"ipv6 cidr miss", "[2001:db9::1]:54321", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, authCalls, nextCalls := newTestPlugin(t, rules, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "http://example.com/x", nil)
+			req.Host = "example.com"
+			req.RemoteAddr = tt.remoteAddr
+
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			if *nextCalls != 1 {
+				t.Fatalf("next called %d times, want 1", *nextCalls)
+			}
+			if gotSkip := *authCalls == 0; gotSkip != tt.expectSkip {
+				t.Fatalf("skip = %v, want %v (auth server called %d times)", gotSkip, tt.expectSkip, *authCalls)
+			}
+		})
+	}
+}
+
 func TestSkipAuthWhen_ConfigErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -237,29 +271,58 @@ func TestSkipAuthWhen_ConfigErrors(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "missing expression",
-			cfg:     &Config{Address: "http://auth", SkipAuthWhen: []SkipRule{{IsExactly: []string{"x"}}}},
-			wantErr: "expression is required",
+			name:    "custom missing expression",
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Custom: []SkipRule{{IsExactly: []string{"x"}}}}},
+			wantErr: "skipAuthWhen.custom[0]: expression is required",
 		},
 		{
 			name:    "no predicates",
-			cfg:     &Config{Address: "http://auth", SkipAuthWhen: []SkipRule{{Expression: "{ .Host }"}}},
-			wantErr: "at least one of",
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Host: &SkipRule{}}},
+			wantErr: "skipAuthWhen.host: at least one of",
 		},
 		{
 			name:    "unparseable template",
-			cfg:     &Config{Address: "http://auth", SkipAuthWhen: []SkipRule{{Expression: "{ .Host", IsExactly: []string{"x"}}}},
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Custom: []SkipRule{{Expression: "{ .Host", IsExactly: []string{"x"}}}}},
 			wantErr: "invalid expression",
 		},
 		{
 			name:    "unknown substitution",
-			cfg:     &Config{Address: "http://auth", SkipAuthWhen: []SkipRule{{Expression: "{ .Hsot }", IsExactly: []string{"x"}}}},
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Custom: []SkipRule{{Expression: "{ .Hsot }", IsExactly: []string{"x"}}}}},
 			wantErr: "cannot be evaluated",
 		},
 		{
 			name:    "invalid regex",
-			cfg:     &Config{Address: "http://auth", SkipAuthWhen: []SkipRule{{Expression: "{ .Host }", MatchesRegex: []string{"["}}}},
-			wantErr: "invalid matchesRegex",
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Host: &SkipRule{MatchesRegex: []string{"["}}}},
+			wantErr: "skipAuthWhen.host: invalid matchesRegex",
+		},
+		{
+			// The error names the offending entry, not just "custom".
+			name: "invalid regex in second custom rule",
+			cfg: &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Custom: []SkipRule{
+				{Expression: "{ .Host }", IsExactly: []string{"x"}},
+				{Expression: "{ .Host }", MatchesRegex: []string{"["}},
+			}}},
+			wantErr: "skipAuthWhen.custom[1]: invalid matchesRegex",
+		},
+		{
+			// A predefined key already names what is tested; an expression
+			// under it is a sign the operator meant custom.
+			name:    "expression under host",
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Host: &SkipRule{Expression: "{ .Host }", IsExactly: []string{"x"}}}},
+			wantErr: "skipAuthWhen.host: expression is only valid under custom",
+		},
+		{
+			// inSubnet on a path is meaningless and must not be silently
+			// ignored, which would leave the operator believing a network
+			// exemption is in place.
+			name:    "inSubnet under path",
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{Path: &SkipRule{InSubnet: []string{"10.0.0.0/8"}}}},
+			wantErr: "skipAuthWhen.path: inSubnet is only valid under clientIp",
+		},
+		{
+			name:    "invalid inSubnet",
+			cfg:     &Config{Address: "http://auth", SkipAuthWhen: SkipRules{ClientIP: &SkipRule{InSubnet: []string{"10.0.0.0/33"}}}},
+			wantErr: `skipAuthWhen.clientIp: invalid inSubnet "10.0.0.0/33"`,
 		},
 	}
 
@@ -277,7 +340,7 @@ func TestSkipAuthWhen_ConfigErrors(t *testing.T) {
 }
 
 func TestSkipAuthWhen_NoRulesAlwaysAuthenticates(t *testing.T) {
-	h, authCalls, _ := newTestPlugin(t, nil, nil)
+	h, authCalls, _ := newTestPlugin(t, SkipRules{}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/anything", nil)
 	req.Host = "example.com"
@@ -286,6 +349,57 @@ func TestSkipAuthWhen_NoRulesAlwaysAuthenticates(t *testing.T) {
 
 	if *authCalls != 1 {
 		t.Fatalf("auth server called %d times, want 1", *authCalls)
+	}
+}
+
+// New derives from the rules which RequestArgs fields ServeHTTP extracts. This
+// is what makes a predefined key cheaper than a custom template, and what lets
+// a deployment without exemptions skip request inspection altogether.
+func TestNew_ComputesNeed(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules SkipRules
+		debug bool
+		want  argsNeed
+	}{
+		{"no rules", SkipRules{}, false, needNone},
+		{"host only", SkipRules{Host: &SkipRule{IsExactly: []string{"a"}}}, false, needHost},
+		{"path only", SkipRules{Path: &SkipRule{IsExactly: []string{"/a"}}}, false, needPath},
+		{"url", SkipRules{URL: &SkipRule{IsExactly: []string{"a/b"}}}, false, needHost | needPath},
+		{"clientIp", SkipRules{ClientIP: &SkipRule{InSubnet: []string{"10.0.0.0/8"}}}, false, needClientIP},
+		{"userAgent", SkipRules{UserAgent: &SkipRule{Contains: []string{"bot"}}}, false, needUserAgent},
+		{
+			"host and clientIp are unioned",
+			SkipRules{Host: &SkipRule{IsExactly: []string{"a"}}, ClientIP: &SkipRule{IsExactly: []string{"b"}}},
+			false, needHost | needClientIP,
+		},
+		{"custom needs everything", SkipRules{Custom: []SkipRule{{Expression: "{ .Host }", IsExactly: []string{"a"}}}}, false, needAll},
+		// A debug line prints the request, so debug forces full extraction
+		// even when no rule reads anything.
+		{"no rules with debug", SkipRules{}, true, needAll},
+		{"host only with debug", SkipRules{Host: &SkipRule{IsExactly: []string{"a"}}}, true, needAll},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := CreateConfig()
+			cfg.Address = "http://auth"
+			cfg.SkipAuthWhen = tt.rules
+			cfg.Debug = tt.debug
+
+			h, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), cfg, "test")
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			plugin, ok := h.(*ConditionalForwardAuth)
+			if !ok {
+				t.Fatalf("New returned %T, want *ConditionalForwardAuth", h)
+			}
+			if plugin.need != tt.want {
+				t.Errorf("need = %06b, want %06b", plugin.need, tt.want)
+			}
+		})
 	}
 }
 
@@ -327,7 +441,7 @@ func TestNewRequestArgs(t *testing.T) {
 	req.Header.Set("User-Agent", "test-agent/1.0")
 	req.RemoteAddr = "198.51.100.4:9999"
 
-	got := newRequestArgs(req)
+	got := newRequestArgs(req, needAll)
 
 	want := RequestArgs{
 		Host:      "example.com:8080",
@@ -350,6 +464,49 @@ func TestNewRequestArgs(t *testing.T) {
 		if strings.Contains(v, "x=1") || strings.Contains(v, "frag") {
 			t.Errorf("%s = %q leaks query or fragment", name, v)
 		}
+	}
+}
+
+// Only the requested fields are extracted; the rest stay at their zero value.
+// A rule never reads a field it did not ask for, so leaving the others empty
+// is both safe and the point: it is where the per-request saving comes from.
+func TestNewRequestArgs_OnlyRequestedFields(t *testing.T) {
+	newReq := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/a/b", nil)
+		req.Host = "example.com:8080"
+		req.Header.Set("User-Agent", "test-agent/1.0")
+		req.RemoteAddr = "198.51.100.4:9999"
+		return req
+	}
+
+	tests := []struct {
+		name string
+		need argsNeed
+		want RequestArgs
+	}{
+		{"none", needNone, RequestArgs{}},
+		{"host", needHost, RequestArgs{Host: "example.com:8080"}},
+		{"path", needPath, RequestArgs{Path: "/a/b"}},
+		{"method", needMethod, RequestArgs{Method: http.MethodPost}},
+		{"scheme", needScheme, RequestArgs{Scheme: "http"}},
+		{"userAgent", needUserAgent, RequestArgs{UserAgent: "test-agent/1.0"}},
+		{"clientIp", needClientIP, RequestArgs{ClientIp: "198.51.100.4"}},
+		{"host and path", needHost | needPath, RequestArgs{Host: "example.com:8080", Path: "/a/b"}},
+		{
+			"all", needAll,
+			RequestArgs{
+				Host: "example.com:8080", Path: "/a/b", Method: http.MethodPost,
+				Scheme: "http", UserAgent: "test-agent/1.0", ClientIp: "198.51.100.4",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := newRequestArgs(newReq(), tt.need); got != tt.want {
+				t.Errorf("newRequestArgs(req, %06b) = %+v, want %+v", tt.need, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -407,6 +564,7 @@ func benchRequest() *http.Request {
 	return req
 }
 
+// Full extraction, which is what a custom rule or debug: true pays.
 func BenchmarkNewRequestArgs(b *testing.B) {
 	req := benchRequest()
 
@@ -414,46 +572,83 @@ func BenchmarkNewRequestArgs(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = newRequestArgs(req)
+		_ = newRequestArgs(req, needAll)
 	}
 }
 
-// End-to-end skip decision, including RequestArgs extraction.
+// Extraction for the cheapest configuration: a single host rule.
+func BenchmarkNewRequestArgs_HostOnly(b *testing.B) {
+	req := benchRequest()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = newRequestArgs(req, needHost)
+	}
+}
+
+// End-to-end skip decision with predefined keys, including RequestArgs
+// extraction. Compare with BenchmarkSkipAuth_EndToEnd_Custom, which expresses
+// the same two rules as templates.
 func BenchmarkSkipAuth_EndToEnd(b *testing.B) {
-	skipper, err := NewAuthSkipper([]SkipRule{
-		{Expression: "{ .Host }", IsExactly: []string{"public.example.com"}},
-		{Expression: "{ .Host }{ .Path }", StartsWith: []string{"api.example.com/v1/"}},
+	skipper, err := NewAuthSkipper(SkipRules{
+		Host: &SkipRule{IsExactly: []string{"public.example.com"}},
+		URL:  &SkipRule{StartsWith: []string{"api.example.com/v1/"}},
 	})
 	if err != nil {
 		b.Fatalf("NewAuthSkipper: %v", err)
 	}
 
-	plugin := &ConditionalForwardAuth{skipper: *skipper}
+	plugin := &ConditionalForwardAuth{skipper: *skipper, need: skipper.need}
 	req := benchRequest()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = !plugin.skipper.empty() && plugin.skipper.ShouldSkip(newRequestArgs(req))
+		_ = plugin.need != needNone && plugin.skipper.ShouldSkip(newRequestArgs(req, plugin.need))
+	}
+}
+
+// The same decision as BenchmarkSkipAuth_EndToEnd, written as custom templates:
+// every RequestArgs field is extracted and each template is rendered per
+// request. The gap between the two is what the predefined keys buy.
+func BenchmarkSkipAuth_EndToEnd_Custom(b *testing.B) {
+	skipper, err := NewAuthSkipper(SkipRules{Custom: []SkipRule{
+		{Expression: "{ .Host }", IsExactly: []string{"public.example.com"}},
+		{Expression: "{ .Host }{ .Path }", StartsWith: []string{"api.example.com/v1/"}},
+	}})
+	if err != nil {
+		b.Fatalf("NewAuthSkipper: %v", err)
+	}
+
+	plugin := &ConditionalForwardAuth{skipper: *skipper, need: skipper.need}
+	req := benchRequest()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = plugin.need != needNone && plugin.skipper.ShouldSkip(newRequestArgs(req, plugin.need))
 	}
 }
 
 // Deployments without exemptions must not pay for RequestArgs extraction.
 func BenchmarkSkipAuth_NoRules(b *testing.B) {
-	skipper, err := NewAuthSkipper(nil)
+	skipper, err := NewAuthSkipper(SkipRules{})
 	if err != nil {
 		b.Fatalf("NewAuthSkipper: %v", err)
 	}
 
-	plugin := &ConditionalForwardAuth{skipper: *skipper}
+	plugin := &ConditionalForwardAuth{skipper: *skipper, need: skipper.need}
 	req := benchRequest()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = !plugin.skipper.empty() && plugin.skipper.ShouldSkip(newRequestArgs(req))
+		_ = plugin.need != needNone && plugin.skipper.ShouldSkip(newRequestArgs(req, plugin.need))
 	}
 }
 
