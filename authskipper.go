@@ -235,7 +235,31 @@ func checkRulePlacement(name string, kind ruleKind, rule SkipRule) error {
 }
 
 // compilePredicates builds the lookup map, regexes and subnets from source.
+//
+// An empty value is rejected everywhere. "" is a prefix, suffix and substring
+// of every string and an empty regex matches everything, so a single empty
+// entry would exempt the whole route — and it is easy to produce by accident:
+// a trailing comma in a Traefik label ("/health," decodes to ["/health", ""])
+// or a bare "-" in a YAML list.
 func (c *compiledSkipRule) compilePredicates() error {
+	for _, p := range []struct {
+		name   string
+		values []string
+	}{
+		{predicateIsExactly, c.source.IsExactly},
+		{predicateStartsWith, c.source.StartsWith},
+		{predicateEndsWith, c.source.EndsWith},
+		{predicateContains, c.source.Contains},
+		{predicateMatchesRegex, c.source.MatchesRegex},
+		{predicateInSubnet, c.source.InSubnet},
+	} {
+		for _, v := range p.values {
+			if v == "" {
+				return fmt.Errorf("skipAuthWhen.%s: %s has an empty value, which would match every request", c.name, p.name)
+			}
+		}
+	}
+
 	if len(c.source.IsExactly) > 0 {
 		c.isExactly = make(map[string]struct{}, len(c.source.IsExactly))
 		for _, v := range c.source.IsExactly {
@@ -296,24 +320,42 @@ func compileExpression(name, expression string) (*template.Template, error) {
 
 // parseSubnet accepts CIDR notation or a bare address, which is treated as a
 // single-host network.
+//
+// IPv4-mapped IPv6 input ("::ffff:10.0.0.0/104", "::ffff:10.0.0.7") is
+// converted to its IPv4 form, because matchSubnets unmaps the client address
+// and netip.Prefix.Contains never matches across families: left as written,
+// such a network would compile and then never match anything.
 func parseSubnet(s string) (netip.Prefix, error) {
-	if strings.Contains(s, "/") {
-		prefix, err := netip.ParsePrefix(s)
+	if !strings.Contains(s, "/") {
+		addr, err := netip.ParseAddr(s)
 		if err != nil {
 			return netip.Prefix{}, err
 		}
-		// Masked so that "10.0.0.7/24" means the network 10.0.0.0/24, as
-		// every other tool reads it, rather than failing a Contains check
-		// because the host bits differ.
-		return prefix.Masked(), nil
+		addr = addr.Unmap().WithZone("")
+		return netip.PrefixFrom(addr, addr.BitLen()), nil
 	}
 
-	addr, err := netip.ParseAddr(s)
+	prefix, err := netip.ParsePrefix(s)
 	if err != nil {
 		return netip.Prefix{}, err
 	}
-	return netip.PrefixFrom(addr, addr.BitLen()), nil
+
+	if prefix.Addr().Is4In6() {
+		if prefix.Bits() < ipv4MappedPrefixBits {
+			return netip.Prefix{}, fmt.Errorf("IPv4-mapped prefix %q is shorter than /%d; write it as an IPv4 network", s, ipv4MappedPrefixBits)
+		}
+		prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-ipv4MappedPrefixBits)
+	}
+
+	// Masked so that "10.0.0.7/24" means the network 10.0.0.0/24, as every
+	// other tool reads it, rather than failing a Contains check because the
+	// host bits differ.
+	return prefix.Masked(), nil
 }
+
+// ipv4MappedPrefixBits is the length of the ::ffff:0:0/96 prefix under which
+// IPv4 addresses are embedded in IPv6.
+const ipv4MappedPrefixBits = 96
 
 // ShouldSkip reports whether any rule exempts the request from authentication.
 func (s *AuthSkipper) ShouldSkip(args RequestArgs) bool {
@@ -424,6 +466,8 @@ func matchRule(c *compiledSkipRule, args RequestArgs) (ruleMatch, bool) {
 	case kindPath:
 		value = args.Path
 	case kindURL:
+		// Unambiguous without a separator: Go's server rejects a Host
+		// containing "/" (400), and a cleaned path always starts with one.
 		value = args.Host + args.Path
 	case kindClientIP:
 		value = args.ClientIp

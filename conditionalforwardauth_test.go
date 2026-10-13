@@ -521,6 +521,38 @@ func TestRequestScheme(t *testing.T) {
 	if got := requestScheme(tls); got != "https" {
 		t.Errorf("requestScheme(tls) = %q, want %q", got, "https")
 	}
+
+	// An absolute-form request line, "GET https://example.com/ HTTP/1.1",
+	// sent over plaintext leaves req.URL.Scheme = "https" with no TLS state.
+	// The scheme is client-supplied there and must not be believed.
+	// httptest.NewRequest sets both TLS and URL.Scheme for an https URL, so
+	// TLS is cleared by hand to reproduce what the server would see.
+	spoofed := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	spoofed.TLS = nil
+	if got := requestScheme(spoofed); got != "http" {
+		t.Errorf("requestScheme(absolute-form over plaintext) = %q, want %q", got, "http")
+	}
+}
+
+// End-to-end version of the absolute-form check: a { .Scheme } exemption for
+// https must not be satisfiable by writing "https://" into the request line.
+func TestSkipAuthWhen_SchemeFromRequestLineIsIgnored(t *testing.T) {
+	rules := SkipRules{Custom: []SkipRule{{
+		Expression: "{ .Scheme }",
+		IsExactly:  []string{"https"},
+	}}}
+
+	h, authCalls, _ := newTestPlugin(t, rules, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/metrics", nil)
+	req.TLS = nil // plaintext connection carrying an absolute-form target
+	req.Host = "example.com"
+
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if *authCalls != 1 {
+		t.Fatalf("auth server called %d times, want 1: request-line scheme must not cause a skip", *authCalls)
+	}
 }
 
 func TestClientIP(t *testing.T) {

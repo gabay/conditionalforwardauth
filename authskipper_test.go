@@ -155,12 +155,25 @@ func TestNewAuthSkipper_Errors(t *testing.T) {
 		{"url: inSubnet alongside valid predicate", SkipRules{URL: rule(SkipRule{Contains: []string{"/x"}, InSubnet: []string{"10.0.0.0/8"}})}, "inSubnet is only valid under clientIp", "url"},
 		{"userAgent: expression", SkipRules{UserAgent: rule(SkipRule{Expression: "x", Contains: []string{"x"}})}, "expression is only valid under custom", "userAgent"},
 
-		{"clientIp: no predicates", SkipRules{ClientIP: rule(SkipRule{})}, "inSubnet is required", "clientIp"},
+		{"clientIp: no predicates", SkipRules{ClientIP: rule(SkipRule{})}, "at least one of", "clientIp"},
 		{"clientIp: expression", SkipRules{ClientIP: rule(SkipRule{Expression: "{ .ClientIp }", InSubnet: []string{"10.0.0.0/8"}})}, "expression is only valid under custom", "clientIp"},
 		{"clientIp: bad prefix length", SkipRules{ClientIP: rule(SkipRule{InSubnet: []string{"10.0.0.0/33"}})}, "invalid inSubnet", "clientIp"},
 		{"clientIp: not an address", SkipRules{ClientIP: rule(SkipRule{InSubnet: []string{"example.com"}})}, "invalid inSubnet", "clientIp"},
-		{"clientIp: empty entry", SkipRules{ClientIP: rule(SkipRule{InSubnet: []string{""}})}, "invalid inSubnet", "clientIp"},
 		{"clientIp: address with port", SkipRules{ClientIP: rule(SkipRule{InSubnet: []string{"10.0.0.1:80"}})}, "invalid inSubnet", "clientIp"},
+		{"clientIp: mapped prefix too short", SkipRules{ClientIP: rule(SkipRule{InSubnet: []string{"::ffff:0:0/64"}})}, "invalid inSubnet", "clientIp"},
+
+		// An empty value would match every request: "" is a prefix, suffix
+		// and substring of everything and an empty regex matches anything.
+		// It is also easy to write by accident (trailing comma in a label,
+		// bare "-" in YAML), so it must be a startup error, not a wildcard.
+		{"host: empty startsWith", SkipRules{Host: rule(SkipRule{StartsWith: []string{""}})}, "startsWith has an empty value", "host"},
+		{"host: empty endsWith", SkipRules{Host: rule(SkipRule{EndsWith: []string{""}})}, "endsWith has an empty value", "host"},
+		{"path: empty contains", SkipRules{Path: rule(SkipRule{Contains: []string{""}})}, "contains has an empty value", "path"},
+		{"path: empty regex", SkipRules{Path: rule(SkipRule{MatchesRegex: []string{""}})}, "matchesRegex has an empty value", "path"},
+		{"url: empty isExactly", SkipRules{URL: rule(SkipRule{IsExactly: []string{""}})}, "isExactly has an empty value", "url"},
+		{"clientIp: empty inSubnet", SkipRules{ClientIP: rule(SkipRule{InSubnet: []string{""}})}, "inSubnet has an empty value", "clientIp"},
+		{"trailing comma shape", SkipRules{Path: rule(SkipRule{StartsWith: []string{"/health", ""}})}, "startsWith has an empty value", "path"},
+		{"custom: empty value", custom(SkipRule{Expression: "{ .Host }", Contains: []string{""}}), "contains has an empty value", "custom[0]"},
 	}
 
 	for _, tt := range tests {
@@ -224,6 +237,15 @@ func TestParseSubnet(t *testing.T) {
 		{"2001:db8::1", "2001:db8::1/128", false},
 		{"::1", "::1/128", false},
 		{"0.0.0.0/0", "0.0.0.0/0", false},
+		{"::/0", "::/0", false},
+		// A zone on a bare address is dropped; the client's zone is too.
+		{"fe80::1%eth0", "fe80::1/128", false},
+		// IPv4-mapped input is folded into IPv4, or it could never match the
+		// unmapped client address.
+		{"::ffff:10.0.0.7", "10.0.0.7/32", false},
+		{"::ffff:10.0.0.0/104", "10.0.0.0/8", false},
+		{"::ffff:0:0/96", "0.0.0.0/0", false},
+		{"::ffff:10.0.0.0/64", "", true},
 		{"10.0.0.0/33", "", true},
 		{"10.0.0/8", "", true},
 		{"", "", true},
@@ -322,6 +344,34 @@ func TestAuthSkipper_ShouldSkip_Predefined(t *testing.T) {
 	}
 }
 
+// Host may carry a port, and both host and url include it verbatim: a rule
+// written for the bare name does not match a request that names the port.
+func TestAuthSkipper_HostPortIsPartOfHostAndURL(t *testing.T) {
+	args := benchArgs()
+	args.Host = "api.example.com:8443"
+
+	for _, tt := range []struct {
+		name  string
+		rules SkipRules
+		want  bool
+	}{
+		{"host without port", SkipRules{Host: rule(SkipRule{IsExactly: []string{"api.example.com"}})}, false},
+		{"host with port", SkipRules{Host: rule(SkipRule{IsExactly: []string{"api.example.com:8443"}})}, true},
+		{"url without port", SkipRules{URL: rule(SkipRule{IsExactly: []string{"api.example.com/v1/users"}})}, false},
+		{"url with port", SkipRules{URL: rule(SkipRule{IsExactly: []string{"api.example.com:8443/v1/users"}})}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			skipper, err := NewAuthSkipper(tt.rules)
+			if err != nil {
+				t.Fatalf("NewAuthSkipper: %v", err)
+			}
+			if got := skipper.ShouldSkip(args); got != tt.want {
+				t.Errorf("ShouldSkip() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAuthSkipper_ShouldSkip_InSubnet(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -345,10 +395,17 @@ func TestAuthSkipper_ShouldSkip_InSubnet(t *testing.T) {
 		// A dual-stack listener may report an IPv4 peer as an IPv4-mapped IPv6
 		// address; it must still match an IPv4 subnet.
 		{"ipv4-mapped ipv6 client in ipv4 subnet", []string{"10.0.0.0/8"}, "::ffff:10.0.0.7", true},
+		{"ipv4-mapped subnet matches ipv4 client", []string{"::ffff:10.0.0.0/104"}, "10.0.0.7", true},
+		{"ipv4-mapped bare address matches ipv4 client", []string{"::ffff:10.0.0.7"}, "10.0.0.7", true},
 		{"ipv4 client never matches ipv6 subnet", []string{"2001:db8::/32"}, "10.0.0.1", false},
 		{"ipv6 client never matches ipv4 subnet", []string{"10.0.0.0/8"}, "2001:db8::1", false},
 		{"everything v4", []string{"0.0.0.0/0"}, "203.0.113.9", true},
 		{"everything v4 does not cover v6", []string{"0.0.0.0/0"}, "2001:db8::1", false},
+		{"everything v6", []string{"::/0"}, "2001:db8::1", true},
+		// After unmapping, an IPv4 peer is a 32-bit address: ::/0 does not
+		// cover it. Matching every client takes both 0.0.0.0/0 and ::/0.
+		{"everything v6 does not cover v4", []string{"::/0"}, "10.0.0.7", false},
+		{"both families", []string{"0.0.0.0/0", "::/0"}, "10.0.0.7", true},
 		// Fail closed: an address that does not parse is in no subnet.
 		{"unparseable client ip", []string{"0.0.0.0/0", "::/0"}, "not-an-ip", false},
 		{"empty client ip", []string{"0.0.0.0/0"}, "", false},

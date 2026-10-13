@@ -32,19 +32,19 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		return nil, err
 	}
 
-	// Dumped only once the rules are known to be good: a misconfiguration is
-	// reported as a startup error, not as a debug line.
+	fa, err := NewForwardAuth(ctx, next, config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Dumped only once the whole configuration is known to be good: a
+	// misconfiguration is reported as a startup error, not as a debug line.
 	debug := newDebugLog(config.Debug, name)
 	debug.logStartup(skipper)
 
 	need := skipper.need
 	if debug != nil {
 		need = needAll
-	}
-
-	fa, err := NewForwardAuth(ctx, next, config)
-	if err != nil {
-		return nil, err
 	}
 
 	// Note: trustForwardHeader intentionally plays no part in skip matching.
@@ -134,16 +134,15 @@ func cleanPath(p string) string {
 
 // requestScheme reports the scheme of the connection Traefik accepted.
 //
-// X-Forwarded-Proto is deliberately NOT consulted: it is client-supplied, and
-// honouring it would let a client flip { .Scheme } to satisfy an exemption
-// rule. If Traefik itself sits behind another proxy, prefer expressing such
-// rules with host / path.
+// Only the TLS state of the connection is consulted. X-Forwarded-Proto is
+// client-supplied, and so is req.URL.Scheme: Go keeps the scheme of an
+// absolute-form request line, so a plaintext "GET https://host/path HTTP/1.1"
+// would otherwise report "https". Honoring either would let a client flip
+// { .Scheme } to satisfy an exemption rule. If Traefik itself sits behind a
+// TLS-terminating proxy, prefer expressing such rules with host / path.
 func requestScheme(req *http.Request) string {
 	if req.TLS != nil {
 		return "https"
-	}
-	if req.URL != nil && req.URL.Scheme != "" {
-		return req.URL.Scheme
 	}
 	return "http"
 }
