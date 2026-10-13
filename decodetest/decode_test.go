@@ -149,14 +149,4 @@ func TestDecoderShapes(t *testing.T) {
 			t.Errorf("NewAuthSkipper error = %v, want inSubnet placement error", err)
 		}
 	})
-
-	t.Run("legacy skipUrls still decodes so New can reject it", func(t *testing.T) {
-		cfg, err := decode(t, fromYAML(t, `{skipUrls: [/health]}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(cfg.SkipUrls) != 1 {
-			t.Errorf("SkipUrls = %v, want [/health]", cfg.SkipUrls)
-		}
-	})
 }

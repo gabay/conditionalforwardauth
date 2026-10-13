@@ -68,7 +68,7 @@ http:
 
 | Key | Value tested | Example | Custom equivalent |
 |---|---|---|---|
-| `host` | Request host. May include a port. | `api.example.com` | `{ .Host }` |
+| `host` | Request host, exactly as sent. May include a port (`api.example.com:8443`), and is **not** lowercased: unlike Traefik's `Host()` router rule, matching here is case-sensitive. | `api.example.com` | `{ .Host }` |
 | `path` | URL path only, cleaned. Never includes query or fragment. | `/v1/users` | `{ .Path }` |
 | `url` | Host and path joined with no separator. No scheme. | `api.example.com/v1/users` | `{ .Host }{ .Path }` |
 | `clientIp` | Peer IP from `RemoteAddr`, no port, IPv6 safe. `X-Forwarded-For` is never consulted. The only key that accepts `inSubnet`. | `2001:db8::1` | `{ .ClientIp }` |
@@ -86,9 +86,19 @@ Prefer a predefined key whenever one fits: it is evaluated without rendering a t
 | `endsWith` | Suffix | |
 | `contains` | Substring | |
 | `matchesRegex` | RE2 regex | Partial match; anchor with `^`/`$` for a full match |
-| `inSubnet` | IP within network | **`clientIp` only.** CIDR (`10.0.0.0/8`, `2001:db8::/32`) or a bare address (`127.0.0.1`), which stands for itself. Host bits in a CIDR are masked off (`10.0.0.7/24` means `10.0.0.0/24`). IPv4 clients seen as IPv4-mapped IPv6 (`::ffff:10.0.0.7`) still match IPv4 networks. |
+| `inSubnet` | IP within network | **`clientIp` only.** CIDR (`10.0.0.0/8`, `2001:db8::/32`) or a bare address (`127.0.0.1`), which stands for itself. Host bits in a CIDR are masked off (`10.0.0.7/24` means `10.0.0.0/24`). IPv4-mapped IPv6 forms (`::ffff:10.0.0.7`, `::ffff:10.0.0.0/104`) are folded into IPv4, both in the configuration and for the client, so they match IPv4 networks. Families never cross otherwise: to match every address list both `0.0.0.0/0` and `::/0`. |
 
-All string matching is **case-sensitive**. Every key requires at least one predicate, `expression` is required under `custom` and rejected anywhere else, and `inSubnet` is rejected outside `clientIp`; each of these is a startup error that names the offending key (`skipAuthWhen.path: inSubnet is only valid under clientIp`).
+All string matching is **case-sensitive**. Startup errors, each naming the offending key (`skipAuthWhen.path: inSubnet is only valid under clientIp`):
+
+- a key with no predicate at all;
+- `expression` anywhere but under `custom`, or missing there;
+- `inSubnet` anywhere but under `clientIp`;
+- an **empty value** in any predicate list. `""` is a prefix, suffix and substring of everything and an empty regex matches anything, so one stray empty entry would exempt the whole route. It is easy to produce by accident — a trailing comma in a label (`…startsWith=/health,`) or a bare `-` in a YAML list — hence the hard error.
+
+> [!WARNING]
+> Always write predicates as **lists**. Traefik decodes plugin configuration with a hook that splits a scalar string on commas (so that labels can say `isExactly=a,b`). A regex given as a scalar, `matchesRegex: "^/v[0-9]{1,3}/ping$"`, therefore silently becomes two patterns, `^/v[0-9]{1` and `3}/ping$`, both of which compile and never match. The plugin cannot see this happen; the `debug` startup dump shows what actually loaded.
+>
+> Unknown predicate names (`isExactely:`) are likewise dropped by the decoder before the plugin sees them. Turn on `debug` once after editing rules and check the startup dump.
 
 ### Custom expressions
 
@@ -115,7 +125,7 @@ Each substitution has exactly one spelling: the names above are the only ones ac
 > These rules decide whether to **bypass authentication**, so the plugin deliberately fails closed:
 > - **Paths are normalized** with `path.Clean` before matching. `/public/../admin` is matched as `/admin`, so it cannot satisfy a `startsWith: /public/` rule while the backend serves `/admin`. Note this also drops a trailing slash (`/health/` matches as `/health`).
 > - **Query strings and fragments are never matched.** A value smuggled into `?redirect=/health` cannot trigger an exemption.
-> - **No `X-Forwarded-*` header is ever consulted**, regardless of `trustForwardHeader`. `{ .Scheme }` comes from the accepted connection and `clientIp` from `RemoteAddr`, so a client cannot spoof its way into an exemption. (`trustForwardHeader` still configures the ForwardAuth request itself — it just has no bearing on skip matching.)
+> - **No `X-Forwarded-*` header is ever consulted**, regardless of `trustForwardHeader`. `{ .Scheme }` comes solely from whether the accepted connection is TLS — neither `X-Forwarded-Proto` nor the scheme of an absolute-form request line (`GET https://host/path HTTP/1.1` over plaintext) is believed — and `clientIp` from `RemoteAddr`, so a client cannot spoof its way into an exemption. (`trustForwardHeader` still configures the ForwardAuth request itself — it just has no bearing on skip matching.)
 > - Consequently `clientIp` is the **direct peer**. If Traefik sits behind another proxy or load balancer, that is the intermediary's address, not the end user's, and an IP rule would exempt everything arriving through it. Prefer `host` / `path` rules in that topology.
 > - A client address that does not parse is in **no** subnet, and a template that fails to render at request time is treated as **not matching**: either way the request is authenticated.
 
@@ -144,13 +154,13 @@ skipAuthWhen:
   url:
     startsWith: ["cdn.example.com/assets/"]
   clientIp:
-    isExactly: ["10.0.0.5"]          # or inSubnet: ["10.0.0.5"]
+    inSubnet: ["10.0.0.5"]           # preferred over isExactly for addresses: compares the IP, not its spelling
   custom:
     - expression: "{ .Method } { .Host }{ .Path }"
       isExactly: ["GET example.com/health"]
 ```
 
-Two rules on the same attribute merge into one key — predicates within a key are OR-ed, exactly as rules were. The even older `skipUrls` / `skipUrlsRegex` fields are still rejected at startup with a pointer to `skipAuthWhen`.
+Two rules on the same attribute merge into one key — predicates within a key are OR-ed, exactly as rules were.
 
 ## Performance
 
